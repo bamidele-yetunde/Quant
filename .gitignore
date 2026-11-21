@@ -1,0 +1,22 @@
+# The miner's working state: only the encrypted miner_state.enc is committed
+miner/
+miner.bak*/
+
+# Local research and WorldQuant's documentation (contains account details)
+ideas/
+results/
+docs/
+
+# Secrets
+.miner_key
+.env
+*.key
+
+# Python / editors
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+issue.md
+*.tmp

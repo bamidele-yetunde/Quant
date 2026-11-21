@@ -1,0 +1,95 @@
+name: alpha-miner
+
+# Runs the miner 24/7: each run mines ~5.6 h, saves the encrypted state, then starts the next run.
+# The 6-hourly schedule is only a safety net that restarts the chain if it ever breaks.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit miner_state.enc
+  issues: write     # winner notifications
+  actions: write    # start the next run in the chain
+
+concurrency:
+  group: alpha-miner
+  cancel-in-progress: false
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
+      BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
+      MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      MINER_MINUTES: ${{ vars.MINER_MINUTES || '335' }}
+      MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '5000' }}
+      MINER_TELEGRAM: ${{ vars.MINER_TELEGRAM || 'all' }}
+      MINER_SCOPES: ${{ vars.MINER_SCOPES }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check secrets
+        run: |
+          missing=""
+          for s in BRAIN_EMAIL BRAIN_PASSWORD MINER_STATE_KEY; do
+            [ -n "${!s}" ] || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then echo "::error::Missing repository secrets:$missing"; exit 1; fi
+
+      - name: Restore encrypted state
+        id: restore
+        run: python vault.py unpack
+
+      - name: Mine
+        run: python miner.py
+
+      - name: Post new winners as an issue
+        if: always() && steps.restore.outcome == 'success'
+        run: |
+          python miner.py issue > issue.md
+          if [ -s issue.md ]; then
+            gh issue create --title "New alphas ready ($(date -u +%Y-%m-%d))" --body-file issue.md
+          fi
+
+      - name: Save encrypted state
+        if: always() && steps.restore.outcome == 'success'
+        run: |
+          python vault.py pack
+          git config user.name "alpha-miner"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add miner_state.enc
+          if git diff --cached --quiet; then echo "state unchanged"; exit 0; fi
+          git commit -m "Update miner state [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase -X theirs && git push && exit 0
+            sleep $((i * 5))
+          done
+          echo "::error::could not push the miner state"; exit 1
+
+      - name: Notify failure
+        if: failure()
+        run: python notify.py failed "$RUN_URL"
+
+      - name: Notify stopped
+        if: cancelled()
+        run: python notify.py stopped "$RUN_URL"
+
+      - name: Start the next run
+        if: success() && vars.MINER_CHAIN != 'off'
+        run: gh workflow run alpha-miner.yml --ref "${{ github.ref_name }}"
