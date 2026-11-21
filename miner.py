@@ -315,6 +315,9 @@ class Miner:
         self.gen = None
         self.last_hourly = 0.0
         self.last_idle_refresh = 0.0
+        self._cat_queue: list[str] = []
+        self._cat_done: dict[str, dict] = {}
+        self._cat_thread: threading.Thread | None = None
         self.brain: B.Brain | None = None
         if connect:
             self.brain = B.Brain(*B.credentials())
@@ -442,12 +445,50 @@ class Miner:
         return {f["id"]: f for f in ordered}
 
     def load_catalogs(self, force: bool = False) -> None:
+        """Use cached catalogues; fetch missing/stale ones in a background thread so mining starts at once.
+        (BRAIN's field listing is slow: ~9 minutes per scope.) Only when there's nothing at all to mine
+        with is one catalogue fetched before starting."""
+        todo = []
         for sid in self.scopes:
+            data = load_json(fields_path(sid), None)
+            fresh = data and time.time() - data.get("fetched_ts", 0) < FIELDS_MAX_AGE_DAYS * 86400
+            if data:
+                self.catalogs[sid] = {f["id"]: f for f in data["fields"]}  # stale is fine meanwhile
+            if not data or not fresh or force:
+                todo.append(sid)
+        if todo and not any(self.catalogs.values()):
+            sid = todo.pop(0)
             try:
-                self.catalogs[sid] = self.load_catalog(sid, force)
+                self.catalogs[sid] = self.load_catalog(sid, force=True)
             except B.BrainError as e:
-                log(f"[{sid}] cannot load catalogue: {e}; skipping this scope for now")
-                self.catalogs.setdefault(sid, {})
+                log(f"[{sid}] cannot load catalogue: {e}")
+        for sid in self.scopes:
+            self.catalogs.setdefault(sid, {})
+        todo = [s for s in todo if s not in self._cat_queue]
+        if todo:
+            self._cat_queue.extend(todo)
+            if not (self._cat_thread and self._cat_thread.is_alive()):
+                self._cat_thread = threading.Thread(target=self._fetch_catalogs, daemon=True)
+                self._cat_thread.start()
+
+    def _fetch_catalogs(self) -> None:
+        """Background thread: fetch queued catalogues one at a time; results are picked up by poll_catalogs."""
+        while self._cat_queue:
+            sid = self._cat_queue[0]
+            try:
+                self._cat_done[sid] = self.load_catalog(sid, force=True)
+            except Exception as e:  # keep the cached (or empty) one
+                log(f"[{sid}] cannot load catalogue: {e}")
+            self._cat_queue.pop(0)
+
+    def poll_catalogs(self) -> None:
+        """Main thread: merge catalogues the background thread finished, and widen the search."""
+        if not self._cat_done:
+            return
+        for sid in list(self._cat_done):
+            self.catalogs[sid] = self._cat_done.pop(sid)
+        self.build_order()
+        self.gen = self.candidates()  # restarts the search order; finished work is skipped
 
     def build_order(self) -> None:
         """Global field order: primary scope's interleaving, then fields only other scopes have.
@@ -1053,6 +1094,7 @@ class Miner:
                         log(f"time limit: {len(futures)} simulation(s) in flight go back in the queue")
                     break
                 if not stopping:
+                    self.poll_catalogs()
                     self.hourly()
                 capped = self.sims_today() >= MAX_SIMS_PER_DAY
                 if capped and not cap_logged:
