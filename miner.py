@@ -285,6 +285,11 @@ def num(v, nd=2) -> str:
     return "n/a" if v is None else f"{v:.{nd}f}"
 
 
+def alpha_link(aid: str) -> str:
+    """Page on the BRAIN website where this alpha can be reviewed and submitted."""
+    return f"https://platform.worldquantbrain.com/alpha/{aid}"
+
+
 def settings_line(s: dict) -> str:
     return (f"{s['region']} · D{s['delay']} · {s['universe']} · decay {s['decay']} · "
             f"{s['neutralization']} · trunc {s['truncation']}")
@@ -1046,7 +1051,8 @@ class Miner:
                 f"Returns {pct(w['returns'])} · Drawdown {pct(w['drawdown'])} · Stability {w['stability']:.0%}\n"
                 f"Sharpe by year: {years}\n"
                 f"Last 2 years Sharpe {w['recent_sharpe']:.2f} · max corr with your alphas "
-                f"{w['max_corr_submitted']:.2f}")
+                f"{w['max_corr_submitted']:.2f}\n"
+                f"Open in BRAIN: {alpha_link(w['id'])}")
 
     # ------------------------------------------------------- hourly / daily
     def hourly(self, force: bool = False) -> None:
@@ -1092,7 +1098,7 @@ class Miner:
                             f"Sharpe {num(w['sharpe'])} · Fitness {num(w['fitness'])} · "
                             f"Turnover {pct(w['turnover'])}\n"
                             f"Max corr with your submitted alphas {c:.2f}. Passes the official check right now.\n"
-                            f"BRAIN → Alphas → Unsubmitted → {w['id']} → Submit")
+                            f"Tap to open it, then press Submit:\n{alpha_link(w['id'])}")
                 log(f"today's pick: {w['id']}")
                 break
             if dropped:
@@ -1104,7 +1110,8 @@ class Miner:
                 and now_ny().hour >= PICK_REMINDER_HOUR_NY):
             self.pick["reminded"] = True
             notify.send(f"⏰ Reminder: you haven't submitted today. Today's pick is {self.pick['alpha']}. "
-                        f"The BRAIN day ends at midnight New York time (5 AM in Nigeria).")
+                        f"The BRAIN day ends at midnight New York time (5 AM in Nigeria).\n"
+                        f"{alpha_link(self.pick['alpha'])}")
         save_json(STATE_DIR / "pick.json", self.pick)
 
     def daily_report(self) -> None:
