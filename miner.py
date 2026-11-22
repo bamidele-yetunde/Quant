@@ -67,7 +67,8 @@ def _env(name: str, default: str) -> str:
 MINER_MINUTES = int(_env("MINER_MINUTES", "335" if CLOUD else "0"))
 MAX_SIMS_PER_DAY = int(_env("MINER_MAX_SIMS_PER_DAY", "5000" if CLOUD else "600"))
 TELEGRAM_MODE = _env("MINER_TELEGRAM", "all").lower()
-SCOPES = _env("MINER_SCOPES", "USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500")
+# TOP500 is not screened on its own (lowest yield); every TOP3000 winner is still retried there.
+SCOPES = _env("MINER_SCOPES", "USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000")
 PRIMARY_SCOPE = "USA/1/TOP3000"
 
 # ------------------------------------------------------------------ templates
@@ -514,7 +515,36 @@ class Miner:
                 return 2
             return 1 if ds_of.get(fid) in crowded else 0
 
+        order = self.steer_by_yield(order, ds_of)
         self.order = sorted(order, key=bucket)  # sort is stable: keeps the interleaving
+
+    def steer_by_yield(self, order: list[str], ds_of: dict[str, str]) -> list[str]:
+        """Re-interleave fields so datasets whose screens open families more often get up to 4 fields per
+        round (1 for the weakest). Rates are smoothed so a dataset with little history keeps a fair share."""
+        screens: dict[str, int] = {}
+        hits: dict[str, int] = {}
+        for r in self.tried.values():
+            if r.get("kind") == "screen" and not r.get("error") and r.get("dataset"):
+                ds = r["dataset"]
+                screens[ds] = screens.get(ds, 0) + 1
+                hits[ds] = hits.get(ds, 0) + (abs(r.get("sharpe") or 0) >= SCREEN_SHARPE)
+        prior = (sum(hits.values()) + 1) / (sum(screens.values()) + 20)
+        queues: dict[str, deque] = {}
+        for fid in order:
+            queues.setdefault(ds_of.get(fid, "?"), deque()).append(fid)
+        rate = {ds: (hits.get(ds, 0) + 10 * prior) / (screens.get(ds, 0) + 10) for ds in queues}
+        top = max(rate.values(), default=1) or 1
+        share = {ds: max(1, round(4 * r / top)) for ds, r in rate.items()}
+        out = []
+        while queues:
+            for ds in list(queues):
+                q = queues[ds]
+                for _ in range(share[ds]):
+                    if q:
+                        out.append(q.popleft())
+                if not q:
+                    del queues[ds]
+        return out
 
     # ------------------------------------------------------------ submitted
     def refresh_submitted(self) -> None:
@@ -833,12 +863,9 @@ class Miner:
 
         cands = sorted((r for r in ok if self.gate1(r)), key=lambda r: -(r.get("fitness") or 0))[:GATE_TOP_N]
         if not cands:
-            if ok and fam["kind"] == "tune":
-                best = max(ok, key=lambda r: r.get("fitness") or -9)
-                if ((best.get("fitness") or 0) >= self.min_fitness(best) and stab >= MIN_STABILITY
-                        and B.failed_checks(best.get("checks", {})) == ["CONCENTRATED_WEIGHT"]):
-                    self.open_repair(best, fam, stab)
-                    return "repairing"
+            if fam["kind"] == "tune" and stab >= MIN_STABILITY and self.repair_weight(ok, stab):
+                log(f"{tag}: strong but over-concentrated; repairing")
+                return "repairing"
             log(f"{tag}: no variant passes gate 1 (stability {stab:.0%})")
             return "gate 1"
         if stab < MIN_STABILITY:
@@ -849,16 +876,50 @@ class Miner:
                 return "winner"
         return "gates 3-5"
 
-    def open_repair(self, best: dict, fam: dict, stab: float) -> None:
+    def weight_only(self, r: dict) -> bool:
+        """Strong variant whose only failed check is weight concentration."""
+        return (not r.get("error") and (r.get("sharpe") or 0) > 0
+                and (r.get("fitness") or 0) >= self.min_fitness(r)
+                and B.failed_checks(r.get("checks", {})) == ["CONCENTRATED_WEIGHT"])
+
+    def repair_weight(self, recs: list[dict], stab: float) -> bool:
+        """Open repair families for the (up to 2) best over-concentrated variants. True if any opened."""
+        best = sorted((r for r in recs if self.weight_only(r)), key=lambda r: -(r.get("fitness") or 0))[:2]
+        opened = False
+        for r in best:
+            fid = f"repair2-{r['key']}"
+            if fid in self.fam_active or fid in self.fam_closed:
+                continue
+            self.open_repair(r, stab, fid)
+            opened = True
+        return opened
+
+    def open_repair(self, best: dict, stab: float, fid: str) -> None:
+        """Concentration comes from days when few stocks have data: fill gaps longer, spread weight by rank,
+        and cap each stock tighter."""
         e, s = best["expr"], best["settings"]
         meta = {k: best.get(k) for k in ("category", "dataset", "field", "idea", "template")}
-        specs = [make_spec("repair", f"ts_backfill({e}, 5)", best["scope"], s["decay"], s["neutralization"],
-                           s["truncation"], **meta),
-                 make_spec("repair", e, best["scope"], s["decay"], s["neutralization"], 0.05, **meta),
-                 make_spec("repair", f"ts_backfill({e}, 5)", best["scope"], s["decay"], s["neutralization"],
-                           0.05, **meta)]
-        log(f"family {fam['id'][:12]}: strong but over-concentrated; trying 3 repairs")
-        self.open_family(best, kind="repair", specs=specs, stability=stab)
+        d, n, t = s["decay"], s["neutralization"], s["truncation"]
+        forms = [(f"ts_backfill({e}, 22)", t), (f"ts_backfill({e}, 66)", t), (f"ts_backfill({e}, 66)", 0.05),
+                 (f"rank(ts_backfill({e}, 66))", t), (f"group_rank(ts_backfill({e}, 66), subindustry)", t),
+                 (e, 0.03)]
+        specs = [make_spec("repair", x, best["scope"], d, n, tr, **meta) for x, tr in forms]
+        self.open_family(best, kind="repair", specs=specs, stability=stab, fid=fid)
+
+    def rescue_weight_failures(self) -> None:
+        """Re-repair finished families whose best variants failed only on weight concentration."""
+        by_fam: dict[str, list[dict]] = {}
+        for r in self.tried.values():
+            f = r.get("family")
+            if f and r.get("kind") == "variant" and self.fam_closed.get(f) in ("gate 1", "repairing"):
+                by_fam.setdefault(f, []).append(r)
+        n = 0
+        for fid, recs in by_fam.items():
+            stab = sum(1 for r in recs if (r.get("sharpe") or 0) >= SCREEN_SHARPE) / max(len(recs), 1)
+            if stab >= MIN_STABILITY and self.repair_weight(recs, stab):
+                n += 1
+        if n:
+            log(f"re-repairing {n} earlier families that failed only on weight concentration")
 
     def pnl_of(self, alpha_id: str) -> dict:
         if alpha_id not in self.pnl:
@@ -1071,6 +1132,7 @@ class Miner:
         self.refresh_submitted()  # needs the catalogue to map fields
         self.build_order()
         self.gen = self.candidates()
+        self.rescue_weight_failures()
 
     def run(self) -> None:
         start = time.time()

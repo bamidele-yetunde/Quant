@@ -122,8 +122,8 @@ first (fewest existing alphas on BRAIN), so the search spreads over all the data
 other users rarely touch. Those fields are less likely to be correlated with existing alphas.
 
 **Search areas (scopes).** Every idea is screened in several region/delay/universe combinations, interleaved so
-all of them progress: `USA/D1/TOP3000`, `USA/D1/TOP1000`, `USA/D0/TOP3000` and `USA/D1/TOP500` by default
-(`MINER_SCOPES`). Smaller universes score more in the Challenge. Delay 0 is a separate pool of alphas with stricter
+all of them progress: `USA/D1/TOP3000`, `USA/D1/TOP1000` and `USA/D0/TOP3000` by default
+(`MINER_SCOPES`). TOP500 is no longer screened on its own: in the first 1,500 simulations it had the lowest yield. Smaller universes score more in the Challenge. Delay 0 is a separate pool of alphas with stricter
 cutoffs (Sharpe > 2, Fitness > 1.3). In addition, every alpha that passes on TOP3000 is automatically re-tried on
 TOP1000, TOP500, TOPSP500 and TOP200 (the last two came with the Silver level), and Telegram flags those versions with 📉. Each scope has its own field catalogue
 (`miner/fields*.json`), and tuning variants stay in their idea's scope.
@@ -151,6 +151,10 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 **Combinations of near misses.** At the start of every run the miner takes signals that came close (TOP3000, Delay 1, Sharpe ≥ 1, Fitness 0.5–1.0, failing only on signal strength, not using a field from a submitted alpha). It keeps the best per idea and the top 5 per dataset, then queues up to 90 pairs from different datasets as `rank(A) + rank(B)`. Their noise partly cancels, so a pair often clears Fitness 1.0 where neither signal does alone. Promising pairs are tuned like any other idea.
 
 **Daily pick (country Challenge).** The Nigeria Challenge ranks IS Score, Uniqueness and Days of Submission equally, so one distinct alpha per day beats a burst. Once per New York day, if you haven't submitted yet, the miner re-checks the alphas it already sent you and messages "📅 Today's submission": the one least correlated with your submitted alphas that still passes the official check. Alphas that fail are dropped. If nothing passes, it tries again every hour. After 6 PM New York time (11 PM Nigeria), if you still haven't submitted, it sends one reminder. State is kept in `miner/pick.json`.
+
+**Steering toward what works.** Datasets whose screens open tuning families more often get up to 4 fields per round of
+the interleaving (the weakest get 1), using smoothed hit rates from `tried.jsonl`, so the search leans on productive data
+without abandoning the rest.
 
 **Steering away from what you already have.** At the start of every run the miner reads your submitted alphas.
 Fields from datasets behind 4 or more of them are searched after all other fields, and fields a submitted alpha
@@ -193,8 +197,9 @@ screen's turnover, following WorldQuant's own rule of thumb:
 Families run before any new screening, so promising ideas are finished quickly.
 
 **Repair.** If a family's best variant is strong (Fitness ≥ 1, stable) but fails *only* the weight-concentration
-test, the miner tries three repairs: filling short data gaps (`ts_backfill(expr, 5)`), a lower 5% per-stock cap,
-and both together. Concentration usually comes from days when data is missing for most stocks, so the book
+test, the miner repairs the (up to two) best such variants six ways: filling data gaps for 22 or 66 days (`ts_backfill`),
+the 66-day fill with a 5% per-stock cap, spreading weight by `rank` or by sub-industry `group_rank`, and a 3% cap.
+At the start of every run, finished families that failed only on concentration are re-repaired this way. Concentration usually comes from days when data is missing for most stocks, so the book
 piles into the few that have values. This exact repair turned a near-miss into the account's second submitted alpha.
 
 **4. Gates.** When every variant in a family is done, the best few are put through the filters in
@@ -353,7 +358,7 @@ work from different copies of the progress and overwrite each other. Disable the
 | `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
 | `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |
 | Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |
-| `MINER_SCOPES` | env / repository variable | `USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500` | Search areas (region/delay/universe), interleaved |
+| `MINER_SCOPES` | env / repository variable | `USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000` | Search areas (region/delay/universe), interleaved |
 
 ## 10. Limits, risks and rules
 
