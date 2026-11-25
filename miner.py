@@ -44,6 +44,8 @@ MAX_BAD_YEARS = 1          # gate 3: losing calendar years allowed
 MIN_RECENT_SHARPE = 0.5    # gate 3: Sharpe over the last 2 years
 MAX_CORRELATION = 0.7      # gate 4: daily-PnL correlation with submitted alphas
 SAME_IDEA_CORR = 0.6       # "same idea" / "near-copy" threshold for the Telegram headers
+RECHECK_HOURS = 2          # re-check the whole ready list this often (and right after you submit)
+SUBMITTABLE_MAX = 8        # alphas listed in the "✅ Submittable right now" message
 
 SCREEN_SHARPE = 1.0        # |Sharpe| needed to open a tuning family
 GATE_TOP_N = 3             # best variants of a finished family that go through the gates
@@ -324,6 +326,9 @@ class Miner:
         self._cat_queue: list[str] = []
         self._cat_done: dict[str, dict] = {}
         self._cat_thread: threading.Thread | None = None
+        self._recheck_thread: threading.Thread | None = None
+        self._recheck_done: dict[str, list[str]] | None = None
+        self.last_recheck = 0.0
         self.brain: B.Brain | None = None
         if connect:
             self.brain = B.Brain(*B.credentials())
@@ -496,6 +501,76 @@ class Miner:
         self.build_order()
         self.gen = self.candidates()  # restarts the search order; finished work is skipped
 
+    # ----------------------------------------------- ready-list re-checking
+    def start_recheck(self) -> None:
+        """Re-run BRAIN's official check on every ready alpha in a background thread.
+        Submitting one alpha makes its near-copies fail SELF_CORRELATION, so the list goes stale."""
+        if not self.ready or (self._recheck_thread and self._recheck_thread.is_alive()):
+            return
+        self.last_recheck = time.time()
+        ids = [w["id"] for w in self.ready]
+
+        def job() -> None:
+            out: dict[str, list[str]] = {}
+            for aid in ids:
+                try:
+                    checks = self.brain.check(aid, max_wait=600)
+                except Exception as e:  # unknown for now; keep it
+                    log(f"re-check of {aid} unavailable: {e}")
+                    continue
+                if not checks:
+                    continue
+                out[aid] = B.failed_checks(checks) + [c.get("name") for c in checks
+                                                      if c.get("result") == "PENDING"]
+            self._recheck_done = out
+
+        self._recheck_thread = threading.Thread(target=job, daemon=True)
+        self._recheck_thread.start()
+
+    def poll_recheck(self) -> None:
+        """Main thread: drop ready alphas that now fail, then send the list that can be submitted."""
+        out, self._recheck_done = self._recheck_done, None
+        if out is None:
+            return
+        drop = {a for a, f in out.items() if f}
+        for a in sorted(drop):
+            log(f"{a} now fails {', '.join(out[a])}; dropped from the ready list")
+        if drop:
+            self.ready = [w for w in self.ready if w["id"] not in drop]
+            self.save_ready()
+            if self.pick.get("alpha") in drop:  # today's pick went stale: choose a new one
+                self.pick.pop("alpha", None)
+                self.pick.pop("reminded", None)
+                self.pick["last_try"] = 0
+        passing =sorted((w for w in self.ready if out.get(w["id"]) == []),
+                         key=lambda w: -(w.get("fitness") or 0))
+        # keep only alphas that differ from each other, so submitting one shouldn't knock out the rest
+        chosen: list[dict] = []
+        for w in passing:
+            if w["id"] not in self.pnl:
+                try:
+                    self.pnl_of(w["id"])
+                except B.BrainError:
+                    pass
+            d = self.pnl.get(w["id"]) or {}
+            if all(pearson(d, self.pnl.get(c["id"]) or {}) < SAME_IDEA_CORR for c in chosen):
+                chosen.append(w)
+        ids = [w["id"] for w in chosen]
+        log(f"re-check: {len(passing)} ready alphas pass now, {len(chosen)} distinct; {len(drop)} dropped")
+        if not chosen or ids == self.state.get("last_submittable"):
+            return
+        shown = chosen[:SUBMITTABLE_MAX]
+        lines = [f"✅ Submittable right now ({len(shown)}) — checked {utc_now()[11:16]} UTC",
+                 "Each one is a different idea, so submitting one shouldn't make the others fail:"]
+        for i, w in enumerate(shown, 1):
+            lines.append(f"\n{i}. {w['id']} · {w['scope'].split('/')[-1]} · Sharpe {num(w['sharpe'])} · "
+                         f"Fitness {num(w['fitness'])}\n{alpha_link(w['id'])}")
+        others = len(passing) - len(shown)
+        if others:
+            lines.append(f"\n{others} more pass too (mostly close copies of these); I'll send a fresh list after you submit.")
+        if notify.send("\n".join(lines)):
+            self.state["last_submittable"] = ids
+
     def build_order(self) -> None:
         """Global field order: primary scope's interleaving, then fields only other scopes have.
         Fields near what you've already submitted go last."""
@@ -552,12 +627,12 @@ class Miner:
         return out
 
     # ------------------------------------------------------------ submitted
-    def refresh_submitted(self) -> None:
+    def refresh_submitted(self) -> bool:
         try:
             alphas = self.brain.submitted_alphas()
         except B.BrainError as e:
             log(f"could not read submitted alphas: {e}")
-            return
+            return False
         known = set().union(*self.catalogs.values()) if self.catalogs else set()
         subs = {}
         for a in alphas:
@@ -582,6 +657,7 @@ class Miner:
         if new:
             log(f"{len(subs)} submitted alphas ({len(new)} new)")
         self.save_pnl()
+        return bool(new)
 
     def submitted_today(self) -> bool:
         today = ny_today()
@@ -1059,7 +1135,8 @@ class Miner:
         if not force and time.time() - self.last_hourly < 3600:
             return
         self.last_hourly = time.time()
-        self.refresh_submitted()
+        if self.refresh_submitted() or time.time() - self.last_recheck >= RECHECK_HOURS * 3600 - 60:
+            self.start_recheck()
         try:
             self.daily_pick()
         except B.IdentityCheckRequired:
@@ -1164,6 +1241,7 @@ class Miner:
                     break
                 if not stopping:
                     self.poll_catalogs()
+                    self.poll_recheck()
                     self.hourly()
                 capped = self.sims_today() >= MAX_SIMS_PER_DAY
                 if capped and not cap_logged:
